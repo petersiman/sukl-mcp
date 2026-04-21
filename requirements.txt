@@ -1,0 +1,4 @@
+# Python 3.10+ required (fastmcp dependency)
+fastmcp
+requests
+pdfplumber
