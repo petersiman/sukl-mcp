@@ -260,4 +260,4 @@ if __name__ == "__main__":
     threading.Thread(target=_warm_cache, daemon=True).start()
 
     print(f"Starting SUKL MCP server on port {port}...", flush=True)
-    mcp.run(transport="sse", host="0.0.0.0", port=port)
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
