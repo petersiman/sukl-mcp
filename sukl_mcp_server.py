@@ -77,10 +77,10 @@ def _fetch_name(kod: str) -> tuple[str, str]:
 
 def _build_product_map() -> dict[str, str]:
     """Fetch all reimbursed product codes, then batch-fetch their names."""
-    print("Načítám seznam hrazených přípravků...", flush=True)
+    print("Fetching list of reimbursed products...", flush=True)
     period = fetch_latest_period()
     codes = fetch_product_codes(period, typ_seznamu="scau")
-    print(f"Nalezeno {len(codes)} přípravků za období {period}. Načítám názvy...", flush=True)
+    print(f"Found {len(codes)} products for period {period}. Fetching names...", flush=True)
 
     product_map: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -92,9 +92,9 @@ def _build_product_map() -> dict[str, str]:
                 product_map[kod] = name
             done += 1
             if done % 500 == 0:
-                print(f"  {done}/{len(codes)} načteno...", flush=True)
+                print(f"  {done}/{len(codes)} fetched...", flush=True)
 
-    print(f"Cache připravena: {len(product_map)} přípravků.", flush=True)
+    print(f"Cache ready: {len(product_map)} products.", flush=True)
     return product_map
 
 
@@ -251,13 +251,13 @@ if __name__ == "__main__":
 
     # Build cache in background so the server port opens immediately
     def _warm_cache():
-        print("Sestavuji cache názvů přípravků na pozadí...", flush=True)
+        print("Building product name cache in background...", flush=True)
         try:
             get_product_map()
         except Exception as e:
-            print(f"Varování: Cache se nepodařilo sestavit ({e}). Zkusí se znovu při prvním dotazu.", flush=True)
+            print(f"Warning: cache build failed ({e}). Will retry on first query.", flush=True)
 
     threading.Thread(target=_warm_cache, daemon=True).start()
 
-    print(f"Spouštím SÚKL MCP server na portu {port}...", flush=True)
+    print(f"Starting SUKL MCP server on port {port}...", flush=True)
     mcp.run(transport="sse", host="0.0.0.0", port=port)
