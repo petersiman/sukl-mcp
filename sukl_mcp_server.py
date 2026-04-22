@@ -1,9 +1,11 @@
 """
 SUKL MCP Server — exposes Czech SÚKL drug database via MCP protocol.
 
-Provides two tools:
-  - sukl_search(name)        search reimbursed drugs by name
-  - sukl_drug_info(sukl_kod) get reimbursement + dosing info for a drug
+Provides one tool:
+  - sukl_drug_info(sukl_kod)  get reimbursement + dosing info for a drug
+
+Note: The SUKL API has no text/name search endpoint. Users should look up
+the 7-digit SUKL code at https://prehledy.sukl.cz/prehled_leciv.html
 
 Usage:
   python sukl_mcp_server.py [port]   (default port: 8000)
@@ -12,12 +14,8 @@ Dependencies:
   pip install fastmcp requests pdfplumber
 """
 
-import json
+import os
 import sys
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
-from pathlib import Path
 
 from fastmcp import FastMCP
 
@@ -26,171 +24,28 @@ from sukl_api import (
     extract_section_4_2,
     fetch_basic_info,
     fetch_doc_metadata,
-    fetch_latest_period,
-    fetch_product_codes,
     fetch_reimbursement,
     get_spc_url,
 )
 
-# ---------------------------------------------------------------------------
-# Cache — maps kodSukl -> "NAZEV SILA" for reimbursed (SCAU) products only
-# ---------------------------------------------------------------------------
-CACHE_FILE = Path(__file__).parent / "sukl_cache.json"
-CACHE_TTL_DAYS = 7
-MAX_WORKERS = 20  # concurrent threads for batch name fetching
-
-_cache_lock = threading.Lock()  # ensures only one build runs at a time
-
-
-def _load_cache() -> dict:
-    if not CACHE_FILE.exists():
-        return {}
-    try:
-        return json.loads(CACHE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def _save_cache(data: dict):
-    CACHE_FILE.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-
-
-def _cache_is_fresh(cache: dict) -> bool:
-    ts = cache.get("updated_at")
-    if not ts:
-        return False
-    updated = datetime.fromisoformat(ts)
-    age = datetime.now(timezone.utc) - updated.replace(tzinfo=timezone.utc)
-    return age.days < CACHE_TTL_DAYS
-
-
-def _fetch_name(kod: str) -> tuple[str, str]:
-    """Fetch display name for one SUKL code. Returns (kod, display_name)."""
-    try:
-        info = fetch_basic_info(kod)
-        name = info.get("nazev", "")
-        sila = info.get("sila", "")
-        display = f"{name} {sila}".strip()
-        return kod, display
-    except Exception:
-        return kod, ""
-
-
-def _build_product_map() -> dict[str, str]:
-    """Fetch all reimbursed product codes, then batch-fetch their names."""
-    print("Fetching list of reimbursed products...", flush=True)
-    period = fetch_latest_period()
-    codes = fetch_product_codes(period, typ_seznamu="scau")
-    print(f"Found {len(codes)} products for period {period}. Fetching names...", flush=True)
-
-    product_map: dict[str, str] = {}
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(_fetch_name, kod): kod for kod in codes}
-        done = 0
-        for future in as_completed(futures):
-            kod, name = future.result()
-            if name:
-                product_map[kod] = name
-            done += 1
-            if done % 500 == 0:
-                print(f"  {done}/{len(codes)} fetched...", flush=True)
-
-    print(f"Cache ready: {len(product_map)} products.", flush=True)
-    return product_map
-
-
-def get_product_map() -> dict[str, str] | None:
-    """Return {kodSukl: 'NAZEV SILA'}, building/refreshing cache as needed.
-    Returns None if another thread is already building the cache."""
-    cache = _load_cache()
-    if _cache_is_fresh(cache) and cache.get("products"):
-        return cache["products"]
-
-    # Non-blocking acquire: if another thread is already building, return None
-    acquired = _cache_lock.acquire(blocking=False)
-    if not acquired:
-        return None
-
-    try:
-        # Re-check after acquiring — another thread may have just finished
-        cache = _load_cache()
-        if _cache_is_fresh(cache) and cache.get("products"):
-            return cache["products"]
-
-        product_map = _build_product_map()
-        _save_cache(
-            {
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-                "products": product_map,
-            }
-        )
-        return product_map
-    finally:
-        _cache_lock.release()
-
-
-# ---------------------------------------------------------------------------
-# MCP server
-# ---------------------------------------------------------------------------
 mcp = FastMCP("SUKL Drug Database")
-
-
-@mcp.tool()
-def sukl_search(name: str) -> str:
-    """
-    Vyhledá hrazené léčivé přípravky v databázi SÚKL podle názvu.
-    Vrátí seznam kódů SÚKL a názvů přípravků odpovídajících hledanému výrazu.
-    Hledá pouze v přípravcích hrazených pojišťovnou (seznam SCAU).
-
-    Args:
-        name: Název nebo část názvu léčivého přípravku (např. "Jardiance", "Ibuprofen")
-    """
-    product_map = get_product_map()
-    if product_map is None:
-        return (
-            "The product name cache is still being built in the background "
-            "(fetching ~8500 product names from SUKL API). "
-            "Please try again in a few minutes. "
-            "If you already know the SUKL code, use sukl_drug_info directly."
-        )
-
-    query = name.strip().lower()
-
-    matches = sorted(
-        [(k, v) for k, v in product_map.items() if query in v.lower()],
-        key=lambda x: x[1],
-    )
-
-    if not matches:
-        return (
-            f"Žádný hrazený přípravek obsahující '{name}' nebyl nalezen.\n"
-            "Pokud znáte kód SÚKL, použijte přímo nástroj sukl_drug_info."
-        )
-
-    lines = [f"{k}: {v}" for k, v in matches[:50]]
-    result = f"Nalezeno {len(matches)} hrazených přípravků (zobrazeno max. 50):\n\n"
-    result += "\n".join(lines)
-
-    if len(matches) > 50:
-        result += f"\n\n...a dalších {len(matches) - 50} přípravků. Upřesněte název."
-
-    return result
 
 
 @mcp.tool()
 def sukl_drug_info(sukl_kod: str) -> str:
     """
-    Vrátí detailní informace o léčivém přípravku:
-    - Základní identifikační údaje
-    - Úhrada pojišťovnou a podmínky úhrady (indikační omezení)
-    - Dávkování a způsob podání ze Souhrnu údajů o přípravku (SPC, sekce 4.2),
-      včetně případné redukce dávky u speciálních populací
+    Returns detailed information about a Czech medicinal product:
+    - Basic identification (name, form, ATC code, registration status)
+    - Insurance reimbursement amount and conditions (indikační omezení)
+    - Dosing and administration from the SPC document (section 4.2),
+      including dose reductions for special populations
+
+    The SUKL API has no name search — users must provide the 7-digit SUKL
+    code, which can be looked up at https://prehledy.sukl.cz/prehled_leciv.html
 
     Args:
-        sukl_kod: 7-místný kód SÚKL přípravku (např. "0210027"). Kratší kódy
-                  jsou automaticky doplněny nulami zleva.
+        sukl_kod: 7-digit SUKL code (e.g. "0210027"). Shorter codes are
+                  automatically zero-padded on the left.
     """
     kod = sukl_kod.strip().zfill(7)
     sections = []
@@ -216,7 +71,8 @@ def sukl_drug_info(sukl_kod: str) -> str:
         if not reimb:
             sections.append(
                 "## Úhrada pojišťovnou\n"
-                "Přípravek není evidován v seznamu SCAU (pravděpodobně není hrazen z veřejného zdravotního pojištění)."
+                "Přípravek není evidován v seznamu SCAU "
+                "(pravděpodobně není hrazen z veřejného zdravotního pojištění)."
             )
         else:
             if isinstance(reimb, list):
@@ -259,29 +115,14 @@ def sukl_drug_info(sukl_kod: str) -> str:
                 f"## Dávkování a způsob podání (SPC sekce 4.2)\n{section_42}"
             )
     except Exception as e:
-        sections.append(f"## Dávkování a způsob podání (SPC sekce 4.2)\nChyba při načítání PDF: {e}")
+        sections.append(
+            f"## Dávkování a způsob podání (SPC sekce 4.2)\nChyba při načítání PDF: {e}"
+        )
 
     return "\n\n---\n\n".join(sections)
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    import os
-
-    # Render sets the PORT env var; fall back to CLI arg or 8000
     port = int(os.environ.get("PORT", sys.argv[1] if len(sys.argv) > 1 else 8000))
-
-    # Build cache in background so the server port opens immediately
-    def _warm_cache():
-        print("Building product name cache in background...", flush=True)
-        try:
-            get_product_map()
-        except Exception as e:
-            print(f"Warning: cache build failed ({e}). Will retry on first query.", flush=True)
-
-    threading.Thread(target=_warm_cache, daemon=True).start()
-
     print(f"Starting SUKL MCP server on port {port}...", flush=True)
     mcp.run(transport="sse", host="0.0.0.0", port=port)
