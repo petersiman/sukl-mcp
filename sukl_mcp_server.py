@@ -14,6 +14,7 @@ Dependencies:
 
 import json
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +38,8 @@ from sukl_api import (
 CACHE_FILE = Path(__file__).parent / "sukl_cache.json"
 CACHE_TTL_DAYS = 7
 MAX_WORKERS = 20  # concurrent threads for batch name fetching
+
+_cache_lock = threading.Lock()  # ensures only one build runs at a time
 
 
 def _load_cache() -> dict:
@@ -98,20 +101,34 @@ def _build_product_map() -> dict[str, str]:
     return product_map
 
 
-def get_product_map() -> dict[str, str]:
-    """Return {kodSukl: 'NAZEV SILA'}, building/refreshing cache as needed."""
+def get_product_map() -> dict[str, str] | None:
+    """Return {kodSukl: 'NAZEV SILA'}, building/refreshing cache as needed.
+    Returns None if another thread is already building the cache."""
     cache = _load_cache()
     if _cache_is_fresh(cache) and cache.get("products"):
         return cache["products"]
 
-    product_map = _build_product_map()
-    _save_cache(
-        {
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            "products": product_map,
-        }
-    )
-    return product_map
+    # Non-blocking acquire: if another thread is already building, return None
+    acquired = _cache_lock.acquire(blocking=False)
+    if not acquired:
+        return None
+
+    try:
+        # Re-check after acquiring — another thread may have just finished
+        cache = _load_cache()
+        if _cache_is_fresh(cache) and cache.get("products"):
+            return cache["products"]
+
+        product_map = _build_product_map()
+        _save_cache(
+            {
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "products": product_map,
+            }
+        )
+        return product_map
+    finally:
+        _cache_lock.release()
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +148,14 @@ def sukl_search(name: str) -> str:
         name: Název nebo část názvu léčivého přípravku (např. "Jardiance", "Ibuprofen")
     """
     product_map = get_product_map()
+    if product_map is None:
+        return (
+            "The product name cache is still being built in the background "
+            "(fetching ~8500 product names from SUKL API). "
+            "Please try again in a few minutes. "
+            "If you already know the SUKL code, use sukl_drug_info directly."
+        )
+
     query = name.strip().lower()
 
     matches = sorted(
@@ -244,7 +269,6 @@ def sukl_drug_info(sukl_kod: str) -> str:
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import os
-    import threading
 
     # Render sets the PORT env var; fall back to CLI arg or 8000
     port = int(os.environ.get("PORT", sys.argv[1] if len(sys.argv) > 1 else 8000))
