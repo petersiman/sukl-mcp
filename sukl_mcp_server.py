@@ -243,13 +243,21 @@ def sukl_drug_info(sukl_kod: str) -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
+    import os
+    import threading
 
-    print(f"Spouštím SÚKL MCP server na portu {port}...")
-    print("Sestavuji cache názvů přípravků (může trvat ~60 sekund)...")
-    try:
-        get_product_map()
-    except Exception as e:
-        print(f"Varování: Cache se nepodařilo sestavit ({e}). Zkusí se znovu při prvním dotazu.")
+    # Render sets the PORT env var; fall back to CLI arg or 8000
+    port = int(os.environ.get("PORT", sys.argv[1] if len(sys.argv) > 1 else 8000))
 
+    # Build cache in background so the server port opens immediately
+    def _warm_cache():
+        print("Sestavuji cache názvů přípravků na pozadí...", flush=True)
+        try:
+            get_product_map()
+        except Exception as e:
+            print(f"Varování: Cache se nepodařilo sestavit ({e}). Zkusí se znovu při prvním dotazu.", flush=True)
+
+    threading.Thread(target=_warm_cache, daemon=True).start()
+
+    print(f"Spouštím SÚKL MCP server na portu {port}...", flush=True)
     mcp.run(transport="sse", host="0.0.0.0", port=port)
